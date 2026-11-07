@@ -120,9 +120,8 @@ private:
     void saveSettings();
     void collectFiles();
     int findIndexByPath(const QString &path) const;
-    double probeDuration(const QString &path);
     QString uniqueOutputPath(const QString &cleanName) const;
-    QString cropFilterFor(const QString &text, int *w, int *h) const;
+    QString lastStderrLine() const;
 
     QString m_watchDir;
     QString m_destDir;
@@ -147,7 +146,7 @@ private:
     int m_lookupIndex = -1;
 
     QProcess m_process;
-    QString m_stage; // "crop", "measure", "encode", "probe"
+    QString m_stage; // "await-lookup", "crop", "measure", "encode"
     int m_currentIndex = -1;
     QList<int> m_queue;
     QString m_cropString;
@@ -155,7 +154,9 @@ private:
     QString m_tmpOutput;
     QString m_finalOutput;
     double m_duration = 0;
-    QString m_lastOutput;
+    QString m_stderrTail;
+    int m_probeW = 0, m_probeH = 0;
+    int m_cropW = 0, m_cropH = 0;
 
     QStringList m_log;
 };

@@ -295,6 +295,12 @@ void Backend::collectFiles()
             const ParsedName parsed = parseFilename(item.fileName);
             item.artist = parsed.artist;
             item.title = parsed.title;
+            // A file whose cleaned name already exists in the destination
+            // was processed before — mark it Done so auto-process doesn't
+            // redo the whole folder after a restart.
+            const QString clean = cleanedFileName(item.artist, item.title, QFileInfo(path).suffix());
+            if (!clean.isEmpty() && !m_destDir.isEmpty() && QFileInfo::exists(m_destDir + "/" + clean))
+                item.status = "Done";
         }
         fresh.append(item);
     }
@@ -433,7 +439,10 @@ void Backend::lookup(int index)
 {
     if (index < 0 || index >= m_items.size())
         return;
-    if (m_busy)
+    // One lookup at a time; process() calls this while already busy, so
+    // "busy" must not block it (that stalled the pipeline with the app
+    // permanently busy and no error shown).
+    if (m_lookupReply)
         return;
     m_lookupIndex = index;
     const VideoItem it = m_items.at(index);
@@ -450,6 +459,9 @@ void Backend::lookup(int index)
     url.setQuery(q);
     QNetworkRequest req(url);
     req.setHeader(QNetworkRequest::UserAgentHeader, "metune/0.1.0 (Omarchy; https://musicbrainz.org/doc/MusicBrainz_API)");
+    // A hanging request must not stall the pipeline — treat a timeout as a
+    // failed lookup and carry on without a year.
+    req.setTransferTimeout(15000);
     auto *reply = m_net.get(req);
     m_lookupReply = reply;
     setStatus(tr("Looking up %1 - %2…").arg(it.artist, it.title));
@@ -476,8 +488,8 @@ void Backend::onLookupFinished(QNetworkReply *reply)
         setStatus(tr("Year lookup failed (offline?) — genre left blank. You can type the year by hand."));
         appendLog(tr("Lookup failed for %1 - %2: %3").arg(it.artist, it.title, reply->errorString()));
         emit videosChanged();
-        // If this lookup was part of a process queue, continue the queue.
-        if (!m_queue.isEmpty() && m_currentIndex == index && m_stage == "await-lookup")
+        // If this lookup was part of an automated process, carry on.
+        if (m_currentIndex == index && m_stage == "await-lookup")
             startCropDetect();
         return;
     }
@@ -512,7 +524,7 @@ void Backend::onLookupFinished(QNetworkReply *reply)
         appendLog(tr("No MusicBrainz date for %1 - %2").arg(it.artist, it.title));
     }
     emit videosChanged();
-    if (!m_queue.isEmpty() && m_currentIndex == index && m_stage == "await-lookup")
+    if (m_currentIndex == index && m_stage == "await-lookup")
         startCropDetect();
 }
 
@@ -526,14 +538,15 @@ QString Backend::parsedTitle(const QString &fileName) const
     return parseFilename(fileName).title;
 }
 
-double Backend::probeDuration(const QString &path)
+QString Backend::lastStderrLine() const
 {
-    QProcess p;
-    p.start("ffprobe", {"-v", "error", "-show_entries", "format=duration",
-                        "-of", "csv=p=0", path});
-    if (!p.waitForFinished(10000))
-        return 0;
-    return QString(p.readAllStandardOutput()).trimmed().toDouble();
+    const auto lines = m_stderrTail.split('\n', Qt::SkipEmptyParts);
+    for (int i = lines.size() - 1; i >= 0; --i) {
+        const QString line = lines[i].trimmed();
+        if (!line.isEmpty() && !line.startsWith("size="))
+            return line.left(200);
+    }
+    return {};
 }
 
 QString Backend::uniqueOutputPath(const QString &cleanName) const
@@ -560,11 +573,15 @@ void Backend::process(int index)
 {
     if (index < 0 || index >= m_items.size() || m_busy)
         return;
-    m_queue = {index};
+    // Single shot: no queue entry, so completeCurrent() won't run it twice.
+    m_queue.clear();
     setBusy(true);
     m_currentIndex = index;
-    // If year is missing, try lookup first (async), then proceed.
-    if (m_items[index].year.isEmpty()) {
+    // If year is missing, try lookup first (async), then proceed. Files
+    // without a parseable artist/title can't be looked up — process them
+    // anyway rather than stalling.
+    const VideoItem &it = m_items.at(index);
+    if (it.year.isEmpty() && !it.artist.isEmpty() && !it.title.isEmpty()) {
         m_stage = "await-lookup";
         m_items[index].status = "Looking up…";
         emit videosChanged();
@@ -615,7 +632,7 @@ void Backend::startNextInQueue()
     }
     m_currentIndex = m_queue.takeFirst();
     VideoItem &it = m_items[m_currentIndex];
-    if (it.year.isEmpty()) {
+    if (it.year.isEmpty() && !it.artist.isEmpty() && !it.title.isEmpty()) {
         m_stage = "await-lookup";
         it.status = "Looking up…";
         emit videosChanged();
@@ -636,14 +653,19 @@ void Backend::startCropDetect()
     it.status = "Analyzing…";
     it.progress = 0;
     emit videosChanged();
-    m_duration = probeDuration(it.path);
+    m_stderrTail.clear();
+    m_cropString.clear();
+    m_probeW = m_probeH = 0;
     if (m_cropBars) {
         // Sample 30s starting at 10s to keep it fast; music videos are short.
         m_process.start("ffmpeg", {"-hide_banner", "-y", "-ss", "10", "-t", "30",
                                    "-i", it.path, "-vf", "cropdetect=limit=24:round=2",
                                    "-f", "null", "-"});
+        if (!m_process.waitForStarted(5000)) {
+            completeCurrent(false, tr("Could not start ffmpeg — is it installed?"));
+            return;
+        }
     } else {
-        m_cropString.clear();
         startLoudnormMeasure();
     }
 }
@@ -654,14 +676,18 @@ void Backend::startLoudnormMeasure()
     m_stage = "measure";
     it.status = "Measuring loudness…";
     emit videosChanged();
+    m_stderrTail.clear();
+    m_measuredJson.clear();
     if (m_normalize) {
-        m_measuredJson.clear();
         // Keep the whole output; loudnorm prints JSON to stderr at the end.
         m_process.start("ffmpeg", {"-hide_banner", "-i", it.path, "-vn",
                                    "-af", "loudnorm=I=-14:TP=-1.5:LRA=11:print_format=json",
                                    "-f", "null", "-"});
+        if (!m_process.waitForStarted(5000)) {
+            completeCurrent(false, tr("Could not start ffmpeg — is it installed?"));
+            return;
+        }
     } else {
-        m_measuredJson.clear();
         startFinalEncode();
     }
 }
@@ -695,10 +721,10 @@ void Backend::startFinalEncode()
     bool reencodeVideo = !m_cropString.isEmpty();
     if (!m_cropString.isEmpty())
         args << "-vf" << m_cropString;
-    if (m_normalize && !m_measuredJson.isEmpty()) {
-        // m_measuredJson holds the "measured_*" lines; build filter from them.
-        const QJsonObject j = QJsonDocument::fromJson(m_measuredJson.toUtf8()).object();
-        auto get = [&](const QString &key) { return j.value(key).toString("0"); };
+    const QJsonObject measured = QJsonDocument::fromJson(m_measuredJson.toUtf8()).object();
+    if (m_normalize && measured.contains("input_i")) {
+        // Two-pass: reuse the measurements for a linear normalization.
+        auto get = [&](const QString &key) { return measured.value(key).toString("0"); };
         const QString filter = QString("loudnorm=I=-14:TP=-1.5:LRA=11:measured_I=%1:measured_TP=%2:measured_LRA=%3:measured_thresh=%4:offset=%5:linear=true:print_format=json")
             .arg(get("input_i"), get("input_tp"), get("input_lra"), get("input_thresh"), get("target_offset"));
         args << "-af" << filter;
@@ -706,6 +732,7 @@ void Backend::startFinalEncode()
         if (!reencodeVideo)
             args << "-c:v" << "copy";
     } else if (m_normalize) {
+        // Measurement gave no usable JSON — single-pass dynamic mode.
         args << "-af" << "loudnorm=I=-14:TP=-1.5:LRA=11" << "-c:a" << "aac" << "-b:a" << "192k";
         if (!reencodeVideo)
             args << "-c:v" << "copy";
@@ -733,24 +760,44 @@ void Backend::startFinalEncode()
     it.status = "Processing…";
     it.progress = 5;
     emit videosChanged();
+    m_stderrTail.clear();
+    m_duration = 0; // parsed from ffmpeg's own "Duration:" line below
     m_process.start("ffmpeg", args);
+    if (!m_process.waitForStarted(5000))
+        completeCurrent(false, tr("Could not start ffmpeg — is it installed?"));
 }
 
 void Backend::onProcessReadyRead()
 {
     const QString text = QString::fromUtf8(m_process.readAllStandardError());
+    // Keep a bounded tail so a failure can show ffmpeg's own error line.
+    m_stderrTail += text;
+    if (m_stderrTail.size() > 4000)
+        m_stderrTail = m_stderrTail.right(4000);
+
     if (m_stage == "crop") {
-        // cropdetect prints "crop=W:H:X:Y" lines; keep the last one.
+        // cropdetect prints "crop=W:H:X:Y" lines; keep the last one. Its
+        // "w:<W> h:<H>" output also tells us the source size, so a
+        // full-frame crop needs no extra ffprobe run.
         static const QRegularExpression re(R"re(crop=(\d+):(\d+):(\d+):(\d+))re");
         auto all = re.globalMatch(text);
         while (all.hasNext()) {
             const auto m = all.next();
             const int w = m.captured(1).toInt();
             const int h = m.captured(2).toInt();
-            if (w > 2 && h > 2)
+            if (w > 2 && h > 2) {
                 m_cropString = QString("crop=%1:%2:%3:%4").arg(m.captured(1), m.captured(2), m.captured(3), m.captured(4));
+                m_cropW = w;
+                m_cropH = h;
+            }
         }
-        // If no crop line yet, keep scanning.
+        static const QRegularExpression reWH(R"re(\bw:(\d+) h:(\d+)\b)re");
+        auto sizes = reWH.globalMatch(text);
+        while (sizes.hasNext()) {
+            const auto m = sizes.next();
+            m_probeW = m.captured(1).toInt();
+            m_probeH = m.captured(2).toInt();
+        }
     } else if (m_stage == "measure") {
         m_measuredJson += text;
         // Extract the JSON block when it arrives.
@@ -763,6 +810,15 @@ void Backend::onProcessReadyRead()
                 m_measuredJson = tail;
         }
     } else if (m_stage == "encode") {
+        // Total duration comes from ffmpeg's own header, so no blocking
+        // ffprobe run is needed on the UI thread.
+        if (m_duration <= 0) {
+            static const QRegularExpression reDur(R"re(Duration: (\d+):(\d+):(\d+)\.(\d+))re");
+            const auto d = reDur.match(text);
+            if (d.hasMatch())
+                m_duration = d.captured(1).toDouble() * 3600 + d.captured(2).toDouble() * 60
+                    + d.captured(3).toDouble() + d.captured(4).toDouble() / 100.0;
+        }
         // Progress: time=HH:MM:SS.ss / duration.
         static const QRegularExpression reTime(R"re(time=(\d+):(\d+):(\d+)\.(\d+))re");
         const auto m = reTime.match(text);
@@ -776,7 +832,6 @@ void Backend::onProcessReadyRead()
                 emit videosChanged();
             }
         }
-        appendLog("ffmpeg: " + text.trimmed().split('\n').last());
     }
 }
 
@@ -787,34 +842,25 @@ void Backend::onProcessFinished(int code, QProcess::ExitStatus status)
             // cropdetect reports a full-frame crop (e.g. 1920:1080:0:0) on
             // videos with no bars. Drop it so video can be copied, not
             // re-encoded.
-            if (!m_cropString.isEmpty() && m_currentIndex >= 0 && m_currentIndex < m_items.size()) {
-                QProcess p;
-                p.start("ffprobe", {"-v", "error", "-select_streams", "v:0",
-                                    "-show_entries", "stream=width,height",
-                                    "-of", "csv=p=0", m_items[m_currentIndex].path});
-                if (p.waitForFinished(10000)) {
-                    const QString wh = p.readAllStandardOutput().trimmed();
-                    int ow = wh.section(',', 0, 0).toInt();
-                    int oh = wh.section(',', 1, 1).toInt();
-                    int cw = 0, ch = 0;
-                    cropFilterFor(m_cropString, &cw, &ch);
-                    if (ow > 0 && oh > 0 && cw >= ow && ch >= oh)
-                        m_cropString.clear();
-                }
-            }
+            if (!m_cropString.isEmpty() && m_probeW > 0 && m_probeH > 0
+                && m_cropW >= m_probeW && m_cropH >= m_probeH)
+                m_cropString.clear();
             appendLog(tr("Black bars: %1").arg(m_cropString.isEmpty() ? tr("none") : m_cropString));
-            startLoudnormMeasure();
         } else {
             // Treat analysis failure as "no crop" and continue.
             appendLog(tr("Crop analysis failed; continuing without crop."));
             m_cropString.clear();
-            startLoudnormMeasure();
         }
+        m_probeW = m_probeH = 0;
+        startLoudnormMeasure();
         return;
     }
     if (m_stage == "measure") {
         if (code != 0) {
-            completeCurrent(false, tr("Loudness measurement failed (code %1).").arg(code));
+            const QString why = lastStderrLine();
+            completeCurrent(false, why.isEmpty()
+                ? tr("Loudness measurement failed (code %1).").arg(code)
+                : tr("Loudness measurement failed: %1").arg(why));
             return;
         }
         // m_measuredJson already holds the JSON tail (or latest chunk).
@@ -840,7 +886,10 @@ void Backend::onProcessFinished(int code, QProcess::ExitStatus status)
                 completeCurrent(false, tr("Could not move the finished file into place."));
             }
         } else {
-            completeCurrent(false, tr("Processing failed (code %1).").arg(code));
+            const QString why = lastStderrLine();
+            completeCurrent(false, why.isEmpty()
+                ? tr("Processing failed (code %1).").arg(code)
+                : tr("Processing failed: %1").arg(why));
         }
         return;
     }
@@ -875,27 +924,22 @@ void Backend::onDirectoryChanged(const QString &path)
 
 void Backend::onDebounceTimeout()
 {
-    const int before = m_items.size();
+    // Never swap the file list out from under a running pipeline — a rescan
+    // mid-processing made indexes point at different files. Wait for idle.
+    if (m_busy) {
+        m_debounce.start();
+        return;
+    }
     collectFiles();
-    if (m_autoProcess && m_items.size() > before) {
-        // Process only new, pending files.
-        m_queue.clear();
-        for (int i = 0; i < m_items.size(); ++i) {
-            if (m_items[i].status == "Pending" && findIndexByPath(m_items[i].path) >= 0) {
-                // New arrival heuristic: scan order puts newest first only
-                // by name; process all pending when auto is on and idle.
-            }
-        }
-        if (!m_busy) {
-            QList<int> fresh;
-            for (int i = 0; i < m_items.size(); ++i)
-                if (m_items[i].status == "Pending")
-                    fresh.append(i);
-            if (!fresh.isEmpty()) {
-                setBusy(true);
-                m_queue = fresh;
-                startNextInQueue();
-            }
+    if (m_autoProcess) {
+        QList<int> fresh;
+        for (int i = 0; i < m_items.size(); ++i)
+            if (m_items[i].status == "Pending")
+                fresh.append(i);
+        if (!fresh.isEmpty()) {
+            setBusy(true);
+            m_queue = fresh;
+            startNextInQueue();
         }
     }
 }
@@ -910,16 +954,4 @@ void Backend::openDestination() const
 {
     if (!m_destDir.isEmpty())
         QDesktopServices::openUrl(QUrl::fromLocalFile(m_destDir));
-}
-
-QString Backend::cropFilterFor(const QString &text, int *w, int *h) const
-{
-    static const QRegularExpression re(R"re(crop=(\d+):(\d+):(\d+):(\d+))re");
-    const auto m = re.match(text);
-    if (m.hasMatch()) {
-        if (w) *w = m.captured(1).toInt();
-        if (h) *h = m.captured(2).toInt();
-        return m.captured(0);
-    }
-    return {};
 }

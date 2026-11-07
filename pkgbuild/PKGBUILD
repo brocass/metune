@@ -1,6 +1,6 @@
 pkgname=metune
 pkgver=0.1.0
-pkgrel=1
+pkgrel=2
 pkgdesc='Clean MeTube music videos for Emby: tidy names, decade genre, −14 LUFS audio, cropped bars'
 arch=('x86_64' 'aarch64')
 license=('MIT')
