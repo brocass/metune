@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Metune
+Name[da]=Metune
+Comment=Clean MeTube music videos for Emby: tidy names, decade genre, -14 LUFS audio, cropped bars
+Comment[da]=Rens MeTube musikvideoer til Emby: pæne navne, årti-genre, -14 LUFS lyd, beskårne bjælker
+Exec=metune open %f
+Icon=metune
+Terminal=false
+Categories=Utility;
+StartupWMClass=metune
