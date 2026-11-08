@@ -138,7 +138,7 @@ QString Backend::decadeForYear(int year)
 {
     if (year < 1900 || year > 2099)
         return {};
-    return QString::number((year / 10) * 10);
+    return QString::number((year / 10) * 10) + "'s";
 }
 
 int Backend::yearFromDateString(const QString &date)

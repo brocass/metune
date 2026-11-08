@@ -41,9 +41,9 @@ private slots:
 
     void decadeFromYearMaps()
     {
-        QCOMPARE(Backend::decadeForYear(2016), QString("2010"));
-        QCOMPARE(Backend::decadeForYear(1998), QString("1990"));
-        QCOMPARE(Backend::decadeForYear(2003), QString("2000"));
+        QCOMPARE(Backend::decadeForYear(2016), QString("2010's"));
+        QCOMPARE(Backend::decadeForYear(1998), QString("1990's"));
+        QCOMPARE(Backend::decadeForYear(2003), QString("2000's"));
         QVERIFY(Backend::decadeForYear(1800).isEmpty());
     }
 

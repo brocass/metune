@@ -13,7 +13,7 @@ and black bars cropped — without touching your originals.
 | MeTube downloads to `/mnt/pool/USENET/MeTube` (root or a playlist subfolder like `NEWMUSIC`) | Watches that folder recursively, skipping `.metube`, hidden folders, and `.part` downloads |
 | Strip the filename to `Artist - Song`, removing `(Official HD Music Video)` | Parses `Artist - Song`, strips trailing junk like `(Official …)`, `[Lyrics]`, `(Official Audio)` — but keeps meaningful titles like `I Ran (So Far Away)` |
 | Tag Artist and Song with Mp3tag | Writes the same `artist`/`title` metadata into the MP4 with ffmpeg, so Emby sees them |
-| Google the song, set Genre to its decade (`2010` for a 2016 song) | Looks the recording up on MusicBrainz and sets `date=<year>` + `genre=<decade>`; edit Year/Genre by hand if it's offline or wrong |
+| Google the song, set Genre to its decade (`2010's` for a 2016 song) | Looks the recording up on MusicBrainz and sets `date=<year>` + `genre=<decade's>`; edit Year/Genre by hand if it's offline or wrong |
 | Shutter Encoder → Audio Normalization, −14 LUFS | ffmpeg loudnorm two-pass to `I=-14 TP=-1.5 LRA=11` — the same loudness target Shutter uses |
 | HandBrake `Music Videos` preset if black bars | ffmpeg `cropdetect` + crop — same end result (bars removed), no GUI preset needed |
 | Move to `/mnt/pool/Videos/Music Videos/MeTube` for Emby | Saves a **fresh copy** there (atomic rename, never overwrites); the watched original stays unless you tick *Remove original* |
